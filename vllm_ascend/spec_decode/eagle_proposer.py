@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import copy
 from typing import Optional
 
 import numpy as np
@@ -7,7 +8,7 @@ import torch.nn as nn
 from vllm.attention.layer import Attention
 from vllm.config import (CompilationMode, CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config)
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -52,7 +53,6 @@ class EagleProposer(Proposer):
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
         self.num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens
-        self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
 
         self.block_size = vllm_config.cache_config.block_size
         # We need to get the hidden size from the draft model config because
@@ -70,7 +70,6 @@ class EagleProposer(Proposer):
             self.vllm_config.compilation_config.mode
             == CompilationMode.VLLM_COMPILE
             and not self.vllm_config.model_config.enforce_eager
-            and not self.use_async_scheduling
             and not self.vllm_config.speculative_config.enforce_eager)
 
         self.cudagraph_batch_sizes = list(
@@ -117,6 +116,18 @@ class EagleProposer(Proposer):
         self.eagle3_use_aux_hidden_state: bool = (
             self._get_eagle3_use_aux_hidden_state_from_config())
 
+        self.last_token_indices = torch.zeros(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=device)
+        slot_mapping_lens = self.runner.max_num_tokens + \
+            2 * get_pcp_group().world_size * self.runner.max_num_reqs
+        self.slot_mapping_group = [
+            torch.zeros(
+                slot_mapping_lens, dtype=torch.int32, device=device,
+                pin_memory=self.runner.pin_memory)
+            for _ in range(self.num_speculative_tokens)]
+
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """
         NOTE(2025-12-18): This is an explicit copy from vLLM EagleProposer, only added
@@ -147,7 +158,10 @@ class EagleProposer(Proposer):
         draft_attn_layer_names = (get_layers_from_vllm_config(
             self.vllm_config, AttentionLayerBase).keys() -
                                   target_attn_layer_names)
-        self.attn_layer_name = next(iter(draft_attn_layer_names))
+        self.piece_all_attn_layer_name []
+        for i in range(self.num_speculative_tokens):
+            self.piece_all_attn_layer_name.append([
+                f"{name}.{i}" for name in draft_attn_layer_names])
 
         # share embed_tokens with the target model if needed
         if get_pp_group().world_size == 1:
@@ -175,15 +189,20 @@ class EagleProposer(Proposer):
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs(
         ) and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
-            self.model = ACLGraphWrapper(self.model,
-                                         self.vllm_config,
-                                         runtime_mode=CUDAGraphMode.FULL)
+            self.forward = ACLGraphWrapper(self.forward,
+                                            self.vllm_config,
+                                            runtime_mode=CUDAGraphMode.FULL)
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
         if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
+
+    def shallow_copy_ascend_metadata(self, attn_metadata):
+        # Currently, new objects will be assigned to the lists in attn_metadata
+        # when update. So we can use the shallow copy.
+        return copy.copy(attn_metadata)
 
     @torch.inference_mode()
     def dummy_run(self,
@@ -233,38 +252,44 @@ class EagleProposer(Proposer):
             dummy_compute_logits(self.hidden_states)
 
             builder = self.runner.attn_groups[0][0].get_metadata_builder()
-            attn_metadata_eagle = builder.build_for_graph_capture(
+            attn_metadata_tmp = builder.build_for_graph_capture(
                 common_attn_metadata, AscendAttentionState.ChunkedPrefill)
             attn_metadata = {}
-            for layer_name in [self.attn_layer_name]:
-                attn_metadata[layer_name] = attn_metadata_eagle
-        for i in range(self.num_speculative_tokens):
-            if i > 0 and in_graph_capturing and aclgraph_runtime_mode == CUDAGraphMode.FULL:
-                aclgraph_runtime_mode = CUDAGraphMode.NONE
-            with set_ascend_forward_context(
-                    attn_metadata,
+            for now_spec, layer_group in enumerate(self.piece_all_attn_layer_name):
+                # update the tensor's address for each spec.
+                attn_metadata_eagle = shallow_copy_ascend_metadata(attn_metadata_tmp)
+                attn_metadata_eagle.slot_mapping = self.slot_mapping_group[now_spec]
+                for layer_name in layer_group:
+                    attn_metadata[layer_name] = attn_metadata_eagle
+        
+        batch_size = num_tokens // (self.num_speculative_tokens + 1)
+        with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_actual_tokens=0,
+                in_profile_run=is_profile,
+                batch_descriptor=batch_descriptor,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                is_draft_model=True,
+                cur_draft_num=0):
+            self.forward(
+                num_tokens,
+                batch_size,
+                self.last_token_indices[:batch_size],
+                # The target_position's address is same as the self.positions's
+                self.positions[:num_tokens],
+            )
+            forward_context = get_forward_context()
+            if (forward_context.cudagraph_runtime_mode
+                    == CUDAGraphMode.FULL
+                    and not forward_context.capturing):
+                update_attn_params(
+                    self.update_stream,
+                    forward_context,
+                    num_tokens,
                     self.vllm_config,
-                    num_tokens=num_tokens,
-                    num_actual_tokens=0,
-                    in_profile_run=is_profile,
-                    batch_descriptor=batch_descriptor,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    is_draft_model=True):
-                forward_context = get_forward_context()
-                self.model(
-                    input_ids=self.input_ids[:num_tokens],
-                    positions=self.positions[:num_tokens],
-                    hidden_states=self.hidden_states[:num_tokens],
                 )
-                if (forward_context.cudagraph_runtime_mode
-                        == CUDAGraphMode.FULL
-                        and not forward_context.capturing):
-                    update_attn_params(
-                        self.update_stream,
-                        forward_context,
-                        num_tokens,
-                        self.vllm_config,
-                    )
 
     def generate_token_ids(self,
                            sampled_token_ids: torch.Tensor | list[list[int]],
@@ -459,22 +484,56 @@ class EagleProposer(Proposer):
         builder = self.runner.attn_groups[0][0].get_metadata_builder()
         attn_metadata = builder.build(0, common_attn_metadata,
                                       self.runner.get_model())
+
+        # Update slot_mapping for different speculative.
+        # NOTE: Currently, we only remake the slot_mapping, because it's the
+        # only tensor which will be used in current FIA.
+        # Strictly speaking, `query_start_loc`, `seq_lens` should also have
+        # their memory allocated separately for each specm just like `slot_mapping`.
+        slot_mapping_lens = num_input_tokens if num_input_tokens < \
+                attn_metadata.slot_mapping.shape[0] else \
+                attn_metadata.slot_mapping.shape[0]
+        self.slot_mapping_group[0][:slot_mapping_lens].copy_(
+            attn_metadata.slot_mapping[:slot_mapping_lens])
+        self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
+        attn_metadata.slot_mapping = self.slot_mapping_group[0][:slot_mapping_lens]
+
         # update global cos, sin
         update_cos_sin(self.positions[:num_input_tokens])
 
+        used_update_positions = target_positions[last_token_indices]
+        final_attn_metadata = {}
+        # The first speculative.
+        for layer_name in self.piece_all_attn_layer_name[0]:
+            final_attn_metadata[layer_name] = attn_metadata
+
+        # Copy the old attn_metadata and update
+        loop_attn_metadata = attn_metadata
+        for now_speculative in range(1, self.num_speculative_tokens):
+            loop_attn_metadata = self.attn_update_stack_num_spec_norm(
+                now_speculative,
+                loop_attn_metadata,
+                batch_size,
+                used_update_positions)
+            for layer_name in self.piece_all_attn_layer_name[now_speculative]:
+                final_attn_metadata[layer_name] = loop_attn_metadata
+        
+        last_token_indices_len = last_token_indices.shape[0]
+        self.last_token_indices[:last_token_indices_len].copy_(last_token_indices)
         with set_ascend_forward_context(
-            {self.attn_layer_name: attn_metadata},
+                final_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 num_actual_tokens=num_tokens,
                 batch_descriptor=batch_descriptor,
                 aclgraph_runtime_mode=aclgraph_runtime_mode,
-                is_draft_model=True):
-            last_hidden_states, hidden_states = self.model(
-                input_ids=self.input_ids[:num_input_tokens],
-                positions=self.positions[:num_input_tokens],
-                hidden_states=self.hidden_states[:num_input_tokens],
-            )
+                is_draft_model=True,
+                cur_draft_num=0):
+            draft_token_ids = self.forward(
+                num_input_tokens,
+                batch_size,
+                self.last_token_indices[:last_token_indices_len],
+                self.positions[:num_tokens])
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                 # TODO: support mla in future.
@@ -484,6 +543,91 @@ class EagleProposer(Proposer):
                     num_input_tokens,
                     self.vllm_config,
                 )
+        return draft_token_ids
+
+    def attn_update_stack_num_spec_norm(self,
+                                        # `now_speculative` must start from `1`, no `0`
+                                        now_speculative,
+                                        old_metadata,
+                                        batch_size,
+                                        used_update_positions):
+
+        assert(now_speculative > 0)
+        attn_metadata = self.shallow_copy_ascend_metadata(old_metadata)
+
+        if now_speculative == 1:
+            attn_metadata.num_actual_tokens = batch_size
+            attn_metadata.max_query_len = 1
+            attn_metadata.query_start_loc = self.arange_cpu[:batch_size + 1]
+            attn_metadata.num_decodes, attn_metadata.num_prefills, attn_metadata.num_decode_tokens, attn_metadata.num_prefill_tokens = 0, batch_size, 0, batch_size
+            attn_metadata.num_actual_tokens_pcp_padded = attn_metadata.num_decode_tokens + attn_metadata.num_prefill_tokens
+
+            attn_metadata.actual_seq_lengths_q = attn_metadata.query_start_loc[
+                1:].tolist()
+            attn_metadata.seq_lens_list = attn_metadata.seq_lens.tolist()
+            attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
+
+        # The loop part
+        attn_metadata.seq_lens = attn_metadata.seq_lens + 1
+        attn_metadata.seq_lens_list = [
+            _ + 1 for _ in attn_metadata.seq_lens_list
+        ]
+
+        attn_mask = self.attn_mask_builder.get_splitfuse_attn_mask()
+        attn_metadata.attn_mask = attn_mask
+
+        used_update_positions += 1
+
+        # NOTE(woosuk): We should handle the case where the draft model
+        # generates tokens beyond the max model length. Since it is complex
+        # to remove such requests from the batch, we keep them in the batch
+        # but adjust the position ids and slot mappings to avoid the
+        # out-of-range access during the model execution. The draft tokens
+        # generated with this adjustment should be ignored.
+        exceeds_max_model_len = used_update_positions >= self.vllm_config.model_config.max_model_len
+        # Mask out the position ids that exceed the max model length.
+        # Otherwise, we may get out-of-range error in RoPE.
+        clamped_positions = torch.where(exceeds_max_model_len, 0,
+                                        used_update_positions)
+
+        # Compute the slot mapping.
+        block_numbers = (clamped_positions // self.block_size)
+        block_ids = attn_metadata.block_tables.gather(
+            dim=1, index=block_numbers.view(-1, 1))
+        block_ids = block_ids.view(-1)
+        slot_mapping_tmp = (
+            block_ids * self.vllm_config.cache_config.block_size +
+            clamped_positions % self.block_size)
+
+        # Mask out the slot mappings that exceed the max model length.
+        # Otherwise, the KV cache will be inadvertently updated with the
+        # padding tokens.
+        slot_mapping_tmp.masked_fill_(exceeds_max_model_len,
+                                      PADDING_SLOT_ID)
+        self.slot_mapping_group[now_speculative][:slot_mapping_tmp.shape[0]].copy_(
+            slot_mapping_tmp.to(torch.int32))
+        self.slot_mapping_group[now_speculative][slot_mapping_tmp.shape[0]:].fill_(
+            PADDING_SLOT_ID)
+        # Switch the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
+        attn_metadata.slot_mapping = self.slot_mapping_group[now_speculative][
+            :slot_mapping_tmp.shape[0]]
+        
+        return attn_metadata
+
+    def forward(
+        self,
+        num_input_tokens,
+        batch_size,
+        last_token_indices,
+        target_positions,
+    ) -> torch.Tensor:
+
+        last_hidden_states, hidden_states = self.model(
+            input_ids=self.input_ids[:num_input_tokens],
+            positions=self.positions[:num_input_tokens],
+            hidden_states=self.hidden_states[:num_input_tokens],
+        )
+
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         draft_token_ids = logits.argmax(dim=-1)
@@ -504,28 +648,11 @@ class EagleProposer(Proposer):
         hidden_states = hidden_states[last_token_indices]
         last_token_indices = self.arange[:batch_size]
 
-        if self.use_cuda_graph and \
-            batch_size <= self.cudagraph_batch_sizes[-1]:
-            input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size)
-        else:
-            input_batch_size = batch_size
+        input_batch_size = num_input_tokens
 
-        attn_metadata.num_actual_tokens = batch_size
-        attn_metadata.max_query_len = 1
-        attn_metadata.query_start_loc = self.arange_cpu[:batch_size + 1]
-        attn_metadata.num_decodes, attn_metadata.num_prefills, attn_metadata.num_decode_tokens, attn_metadata.num_prefill_tokens = 0, batch_size, 0, batch_size
-        attn_metadata.num_actual_tokens_pcp_padded = attn_metadata.num_decode_tokens + attn_metadata.num_prefill_tokens
+        forward_context.num_tokens = input_batch_size
+        forward_context.num_actual_tokens = batch_size
 
-        attn_metadata.actual_seq_lengths_q = attn_metadata.query_start_loc[
-            1:].tolist()
-        attn_metadata.seq_lens_list = attn_metadata.seq_lens.tolist()
-        attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
-        if self.use_cuda_graph:
-            aclgraph_runtime_mode, batch_descriptor = \
-                self.runner.cudagraph_dispatcher.dispatch(num_tokens=input_batch_size, uniform_decode=True, has_lora=has_lora)
-        else:
-            aclgraph_runtime_mode = CUDAGraphMode.NONE
-            batch_descriptor = None
         for now_speculative in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
@@ -545,71 +672,21 @@ class EagleProposer(Proposer):
             clamped_positions = torch.where(exceeds_max_model_len, 0,
                                             positions)
 
-            # TODO: Increment the sequence lengths.
-
-            attn_metadata.seq_lens = attn_metadata.seq_lens + 1
-            attn_metadata.seq_lens_list = [
-                _ + 1 for _ in attn_metadata.seq_lens_list
-            ]
-            # TODO: Consider max model length.
-            # attn_metadata.max_seq_len = min(attn_metadata.max_seq_len,
-            #                                 self.max_model_len)
-            # For the requests that exceed the max model length, we set the
-            # TODO: sequence length to 1 to minimize their overheads in attention.
-
-            # Compute the slot mapping.
-            block_numbers = (clamped_positions // self.block_size)
-            block_ids = attn_metadata.block_tables.gather(
-                dim=1, index=block_numbers.view(-1, 1))
-            block_ids = block_ids.view(-1)
-            slot_mapping_tmp = (
-                block_ids * self.vllm_config.cache_config.block_size +
-                clamped_positions % self.block_size)
-
-            # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
-            slot_mapping_tmp.masked_fill_(exceeds_max_model_len,
-                                          PADDING_SLOT_ID)
-            # NOTE: ASCEND slot_mapping must on cpu
-            attn_metadata.slot_mapping[:slot_mapping_tmp.shape[0]].copy_(
-                slot_mapping_tmp.to(torch.int32))
-            attn_metadata.slot_mapping[slot_mapping_tmp.shape[0]:].fill_(
-                PADDING_SLOT_ID)
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self.positions[:batch_size] = clamped_positions
             self.hidden_states[:batch_size] = hidden_states
-            attn_mask = self.attn_mask_builder.get_splitfuse_attn_mask()
-
-            attn_metadata.attn_mask = attn_mask
 
             # update global cos, sin
             update_cos_sin(self.positions[:input_batch_size])
 
             # Run the model.
-            with set_ascend_forward_context(
-                {self.attn_layer_name: attn_metadata},
-                    self.vllm_config,
-                    num_tokens=input_batch_size,
-                    num_actual_tokens=batch_size,
-                    batch_descriptor=batch_descriptor,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    is_draft_model=True):
-
-                last_hidden_states, hidden_states = self.model(
-                    input_ids=self.input_ids[:input_batch_size],
-                    positions=self.positions[:input_batch_size],
-                    hidden_states=self.hidden_states[:input_batch_size],
-                )
-                forward_context = get_forward_context()
-                if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
-                    update_attn_params(
-                        self.update_stream,
-                        forward_context,
-                        input_batch_size,
-                        self.vllm_config,
-                    )
+            forward_context.cur_draft_num = now_speculative + 1
+            last_hidden_states, hidden_states = self.model(
+                input_ids=self.input_ids[:input_batch_size],
+                positions=self.positions[:input_batch_size],
+                hidden_states=self.hidden_states[:input_batch_size],
+            )
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
 

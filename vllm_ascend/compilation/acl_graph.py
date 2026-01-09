@@ -190,7 +190,11 @@ class ACLGraphWrapper:
         # before the grph replay of iteration i-1.
         # To ensure proper ordering, we must call synchronize here before replaying,
         # so that update_attn_params only executes after the previous graph replay has fully completed.
-        torch.npu.synchronize()
+        # But if we are using speculative inference and between with main model
+        # and draft model replay now, we do not need to synchronize.
+        if not forward_context.is_draft_model or \
+                forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
+            torch.npu.synchronize()
         entry.aclgraph.replay()
         return entry.output
 

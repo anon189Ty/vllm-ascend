@@ -1104,8 +1104,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.spec_decode_common_attn_metadata is None:
                 self.spec_decode_common_attn_metadata = common_attn_metadata
                 if self.speculative_config.method in ("eagle", "eagle3") and \
-                        (self.vllm_config.speculative_config.enforce_eager \
-                         or self.use_async_scheduling):
+                        self.vllm_config.speculative_config.enforce_eager:
                     self.spec_decode_common_attn_metadata = \
                         self.spec_decode_common_attn_metadata.unpadded(
                             total_num_scheduled_tokens, base_num_reqs)
