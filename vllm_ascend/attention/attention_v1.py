@@ -711,6 +711,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
+        forward_context = get_forward_context()
+        if forward_context.is_draft_model and forward_context.cur_draft_num > -1:
+            attn_metadata = attn_metadata[forward_context.cur_draft_num]
         key, value = self.reshape_and_cache(key, value, kv_cache,
                                             attn_metadata)
         # pooling model branch

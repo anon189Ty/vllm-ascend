@@ -190,7 +190,11 @@ class ACLGraphWrapper:
         # before the grph replay of iteration i-1.
         # To ensure proper ordering, we must call synchronize here before replaying,
         # so that update_attn_params only executes after the previous graph replay has fully completed.
-        torch.npu.synchronize()
+        # But if we are using speculative inference and between with main model
+        # and draft model replay now, we do not need to synchronize.
+        if not forward_context.is_draft_model or \
+                forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
+            torch.npu.synchronize()
         entry.aclgraph.replay()
         return entry.output
 
@@ -262,9 +266,21 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
     # linear_attn and self_attn, the attn_metadata is first arranged with
     # self_attn followed by linear_attn. Therefore, using zip directly
     # filters out the update operations for linear_attn.
+    # TODO: We use a new variable `attn_keys` to ensure the loop count is
+    # correct after get by `zip` because of the new structure of the attn_metadata
+    # when running with the merged full eagle-graph. Should check it with Qwen3-next.
+    attn_metadata = forward_context.attn_metadata
+    attn_keys = list(attn_metadata.keys())
+    num_layers = len(attn_keys)
+    assert(num_layers > 0)
+    if forward_context.is_draft_model and forward_context.cur_draft_num > -1 \
+            and attn_metadata:
+        attn_keys = attn_keys * (len(graph_params.attn_params[runtime_shape]) \
+            // num_layers)
+    attn_count = 0
     with torch.npu.stream(update_stream):
         for key, param, handle, event in zip(
-                forward_context.attn_metadata,
+                attn_keys,
                 graph_params.attn_params[runtime_shape],
                 graph_params.handles[runtime_shape],
                 graph_params.events[runtime_shape],
@@ -273,9 +289,15 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
              seq_lens, query_start_loc, num_kv_heads, num_heads, scale,
              attn_output, softmax_lse) = param
 
-            seq_lens = forward_context.attn_metadata[key].seq_lens_list
-            actual_seq_lengths_q = forward_context.attn_metadata[
-                key].actual_seq_lengths_q
+            if forward_context.is_draft_model:
+                now_spec = attn_count // num_layers
+                seq_lens = attn_metadata[key][now_spec].seq_lens_list
+                actual_seq_lengths_q = attn_metadata[key][
+                    now_spec].actual_seq_lengths_q
+            else:
+                seq_lens = attn_metadata[key].seq_lens_list
+                actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+
             torch.npu.graph_task_update_begin(update_stream, handle)
             torch_npu.npu_fused_infer_attention_score.out(
                 query=query,
