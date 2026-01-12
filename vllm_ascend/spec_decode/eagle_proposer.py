@@ -159,7 +159,7 @@ class EagleProposer(Proposer):
             self.vllm_config, AttentionLayerBase).keys() -
                                   target_attn_layer_names)
         self.attn_layer_name_list = draft_attn_layer_names
-        self.piece_all_attn_layer_name []
+        self.piece_all_attn_layer_name = []
         for _ in range(self.num_speculative_tokens):
             self.piece_all_attn_layer_name.append([
                 name for name in draft_attn_layer_names])
@@ -258,7 +258,7 @@ class EagleProposer(Proposer):
             attn_metadata = {}
             for now_spec in range(self.num_speculative_tokens):
                 # update the tensor's address for each spec.
-                attn_metadata_eagle = shallow_copy_ascend_metadata(attn_metadata_tmp)
+                attn_metadata_eagle = self.shallow_copy_ascend_metadata(attn_metadata_tmp)
                 attn_metadata_eagle.slot_mapping = self.slot_mapping_group[now_spec]
                 for layer_name in self.attn_layer_name_list:
                     attn_metadata.setdefault(layer_name, []).append(attn_metadata_eagle)
@@ -651,6 +651,7 @@ class EagleProposer(Proposer):
 
         input_batch_size = num_input_tokens
 
+        forward_context = get_forward_context()
         forward_context.num_tokens = input_batch_size
         forward_context.num_actual_tokens = batch_size
 
