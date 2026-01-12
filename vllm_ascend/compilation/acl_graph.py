@@ -294,6 +294,7 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
                 seq_lens = attn_metadata[key][now_spec].seq_lens_list
                 actual_seq_lengths_q = attn_metadata[key][
                     now_spec].actual_seq_lengths_q
+                attn_count = attn_count + 1
             else:
                 seq_lens = attn_metadata[key].seq_lens_list
                 actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
