@@ -42,6 +42,7 @@ def set_ascend_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     model_instance: torch.nn.Module = None,
     is_draft_model=False,
+    cur_draft_num=-1,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -119,6 +120,7 @@ def set_ascend_forward_context(
         forward_context.prefetch_mlp_enabled = prefetch_mlp_enabled
         forward_context.model_instance = model_instance
         forward_context.is_draft_model = is_draft_model
+        forward_context.cur_draft_num = cur_draft_num
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
