@@ -219,7 +219,7 @@ class EagleProposer(Proposer):
         # update global cos, sin
         update_cos_sin(self.positions[:num_tokens])
 
-        attn_metadata = None
+        attn_metadata_multi_steps = []
         if not self.use_cuda_graph:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
         if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(
@@ -255,17 +255,18 @@ class EagleProposer(Proposer):
             builder = self.runner.attn_groups[0][0].get_metadata_builder()
             attn_metadata_tmp = builder.build_for_graph_capture(
                 common_attn_metadata, AscendAttentionState.ChunkedPrefill)
-            attn_metadata = {}
             for now_spec in range(self.num_speculative_tokens):
                 # update the tensor's address for each spec.
                 attn_metadata_eagle = self.shallow_copy_ascend_metadata(attn_metadata_tmp)
                 attn_metadata_eagle.slot_mapping = self.slot_mapping_group[now_spec]
+                attn_metadata_unit = dict()
                 for layer_name in self.attn_layer_name_list:
-                    attn_metadata.setdefault(layer_name, []).append(attn_metadata_eagle)
+                    attn_metadata_unit[layer_name] = attn_metadata_eagle
+                attn_metadata_multi_steps.append(attn_metadata_unit)
         
         batch_size = num_tokens // (self.num_speculative_tokens + 1)
         with set_ascend_forward_context(
-                attn_metadata,
+                attn_metadata_multi_steps[0] if attn_metadata_multi_steps else None,
                 self.vllm_config,
                 num_tokens=num_tokens,
                 num_actual_tokens=0,
@@ -280,6 +281,7 @@ class EagleProposer(Proposer):
                 self.last_token_indices[:batch_size],
                 # The target_position's address is same as the self.positions's
                 self.positions[:num_tokens],
+                attn_metadata_multi_steps,
             )
             forward_context = get_forward_context()
             if (forward_context.cudagraph_runtime_mode
@@ -290,6 +292,7 @@ class EagleProposer(Proposer):
                     forward_context,
                     num_tokens,
                     self.vllm_config,
+                    attn_metadata_multi_steps,
                 )
 
     def generate_token_ids(self,
@@ -503,26 +506,28 @@ class EagleProposer(Proposer):
         update_cos_sin(self.positions[:num_input_tokens])
 
         used_update_positions = target_positions[last_token_indices]
-        final_attn_metadata = {}
+        attn_metadata_unit = dict()
         # The first speculative.
         for layer_name in self.attn_layer_name_list:
-            final_attn_metadata.setdefault(layer_name, []).append(attn_metadata)
+            attn_metadata_unit[layer_name] = attn_metadata
+        attn_metadata_multi_steps = [attn_metadata_unit]
 
         # Copy the old attn_metadata and update
-        loop_attn_metadata = attn_metadata
         for now_speculative in range(1, self.num_speculative_tokens):
-            loop_attn_metadata = self.attn_update_stack_num_spec_norm(
+            attn_metadata = self.attn_update_stack_num_spec_norm(
                 now_speculative,
-                loop_attn_metadata,
+                attn_metadata,
                 batch_size,
                 used_update_positions)
+            attn_metadata_unit = dict()
             for layer_name in self.attn_layer_name_list:
-                final_attn_metadata[layer_name].append(loop_attn_metadata)
+                attn_metadata_unit[layer_name] = attn_metadata
+            attn_metadata_multi_steps.append(attn_metadata_unit)
         
         last_token_indices_len = last_token_indices.shape[0]
         self.last_token_indices[:last_token_indices_len].copy_(last_token_indices)
         with set_ascend_forward_context(
-                final_attn_metadata,
+                attn_metadata_multi_steps[0],
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 num_actual_tokens=num_tokens,
@@ -534,7 +539,8 @@ class EagleProposer(Proposer):
                 num_input_tokens,
                 batch_size,
                 self.last_token_indices[:last_token_indices_len],
-                self.positions[:num_tokens])
+                self.positions[:num_tokens],
+                attn_metadata_multi_steps)
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                 # TODO: support mla in future.
@@ -543,6 +549,7 @@ class EagleProposer(Proposer):
                     forward_context,
                     num_input_tokens,
                     self.vllm_config,
+                    attn_metadata_multi_steps,
                 )
         return draft_token_ids
 
@@ -621,6 +628,7 @@ class EagleProposer(Proposer):
         batch_size,
         last_token_indices,
         target_positions,
+        attn_metadata_multi_steps,
     ) -> torch.Tensor:
 
         last_hidden_states, hidden_states = self.model(
@@ -684,6 +692,8 @@ class EagleProposer(Proposer):
 
             # Run the model.
             forward_context.cur_draft_num = now_speculative + 1
+            forward_context.attn_metadata = attn_metadata_multi_steps[now_speculative + 1] \
+                if attn_metadata_multi_steps else None
             last_hidden_states, hidden_states = self.model(
                 input_ids=self.input_ids[:input_batch_size],
                 positions=self.positions[:input_batch_size],

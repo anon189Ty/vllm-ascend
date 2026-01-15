@@ -257,11 +257,16 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
             event.record(update_stream)
 
 
-def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
+def _update_attn_fia_params(update_stream, forward_context, runtime_shape,
+                            draft_attn_metadatas=None):
     if forward_context.is_draft_model:
         graph_params = get_draft_graph_params()
+        attn_metadata = draft_attn_metadatas
+        attn_keys = list(attn_metadata[0].keys())
     else:
         graph_params = get_graph_params()
+        attn_metadata = forward_context.attn_metadata
+        attn_keys = list(attn_metadata.keys())
     # For Qwen3-next, since the kv_cache_config has already categorized
     # linear_attn and self_attn, the attn_metadata is first arranged with
     # self_attn followed by linear_attn. Therefore, using zip directly
@@ -269,12 +274,9 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
     # TODO: We use a new variable `attn_keys` to ensure the loop count is
     # correct after get by `zip` because of the new structure of the attn_metadata
     # when running with the merged full eagle-graph. Should check it with Qwen3-next.
-    attn_metadata = forward_context.attn_metadata
-    attn_keys = list(attn_metadata.keys())
     num_layers = len(attn_keys)
     assert(num_layers > 0)
-    if forward_context.is_draft_model and forward_context.cur_draft_num > -1 \
-            and attn_metadata:
+    if forward_context.is_draft_model and forward_context.cur_draft_num > -1:
         attn_keys = attn_keys * (len(graph_params.attn_params[runtime_shape]) \
             // num_layers)
     attn_count = 0
@@ -291,9 +293,9 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
 
             if forward_context.is_draft_model:
                 now_spec = attn_count // num_layers
-                seq_lens = attn_metadata[key][now_spec].seq_lens_list
-                actual_seq_lengths_q = attn_metadata[key][
-                    now_spec].actual_seq_lengths_q
+                seq_lens = attn_metadata[now_spec][key].seq_lens_list
+                actual_seq_lengths_q = attn_metadata[now_spec][
+                    key].actual_seq_lengths_q
                 attn_count = attn_count + 1
             else:
                 seq_lens = attn_metadata[key].seq_lens_list
@@ -323,11 +325,12 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
 
 
 def update_attn_params(update_stream, forward_context, runtime_shape,
-                       vllm_config):
+                       vllm_config, draft_attn_metadatas=None):
     if using_paged_attention(runtime_shape, vllm_config):
         _update_attn_pa_params(update_stream, forward_context, runtime_shape)
     else:
-        _update_attn_fia_params(update_stream, forward_context, runtime_shape)
+        _update_attn_fia_params(update_stream, forward_context, runtime_shape,
+            draft_attn_metadatas)
 
 
 def update_mla_attn_params(update_stream, forward_context, runtime_shape,
