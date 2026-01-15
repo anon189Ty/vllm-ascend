@@ -158,7 +158,7 @@ class EagleProposer(Proposer):
         draft_attn_layer_names = (get_layers_from_vllm_config(
             self.vllm_config, AttentionLayerBase).keys() -
                                   target_attn_layer_names)
-        self.attn_layer_name_list = draft_attn_layer_names
+        self.attn_layer_name_list = list(sorted(draft_attn_layer_names))
         self.piece_all_attn_layer_name = []
         for _ in range(self.num_speculative_tokens):
             self.piece_all_attn_layer_name.append([
