@@ -85,6 +85,8 @@ def split_inputs_tp_to_sp(hidden_states, out):
 
 class EagleProposer(VllmEagleProposer):
 
+    model: Union[nn.Module, ACLGraphWrapper]
+
     def __init__(self,
                  vllm_config: VllmConfig,
                  device: torch.device,
