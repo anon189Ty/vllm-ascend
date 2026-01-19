@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 from contextlib import contextmanager, nullcontext
-from typing import Any, ContextManager, Optional
+from typing import Any, ContextManager, Optional, Union
 
 import numpy as np
 import torch
@@ -347,6 +347,7 @@ class EagleProposer(VllmEagleProposer):
                 last_token_indices=self.last_token_indices[:batch_size],
                 # The target_position's address is same as the self.positions's
                 target_positions=self.positions[:num_tokens],
+                inputs_embeds=None,
                 attn_metadata_multi_steps=attn_metadata_multi_steps,
             )
             forward_context = get_forward_context()
@@ -486,6 +487,7 @@ class EagleProposer(VllmEagleProposer):
                 batch_size=batch_size,
                 last_token_indices=self.last_token_indices[:last_token_indices_len],
                 target_positions=self.positions[:num_tokens],
+                inputs_embeds=inputs_embeds,
                 attn_metadata_multi_steps=attn_metadata_multi_steps)
 
             forward_context = get_forward_context()
@@ -594,12 +596,13 @@ class EagleProposer(VllmEagleProposer):
                           batch_size,
                           last_token_indices,
                           target_positions,
+                          inputs_embeds,
                           attn_metadata_multi_steps,
     ) -> torch.Tensor:
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all speculative tokens' proposings.
         # `model_input_ids`, `model_positions` and `model_hidden_states` are used to represent the inputs of speculative model.
         model_input_ids = self.input_ids[:num_input_tokens]
-        model_positions = self._get_positions[:num_input_tokens]
+        model_positions = self._get_positions(num_input_tokens)
         model_hidden_states = self.hidden_states[:num_input_tokens]
 
         model_hidden_states, model_positions = self.maybe_pad_and_reduce(
@@ -609,7 +612,7 @@ class EagleProposer(VllmEagleProposer):
             input_ids=model_input_ids,
             positions=model_positions,
             hidden_states=model_hidden_states,
-            input_embeds = inputs_embeds,
+            inputs_embeds = inputs_embeds,
         )
         if self.method == "mtp":
             last_hidden_states = ret_hidden_states
@@ -696,7 +699,7 @@ class EagleProposer(VllmEagleProposer):
             # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all speculative tokens' proposings.
             # `model_input_ids`, `model_positions` and `model_hidden_states` are used to represent the inputs of speculative model.
             model_input_ids = self.input_ids[:input_batch_size]
-            model_positions = self._get_positions[:input_batch_size]
+            model_positions = self._get_positions(input_batch_size)
             model_hidden_states = self.hidden_states[:input_batch_size]
 
             model_hidden_states, model_positions = self.maybe_pad_and_reduce(
